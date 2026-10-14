@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.openclaw/
+/AGENTS.md
+/IDENTITY.md
+/SOUL.md
+/USER.md
+/skills/
