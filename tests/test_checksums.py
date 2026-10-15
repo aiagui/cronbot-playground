@@ -77,6 +77,47 @@ class BuildManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("root is not a directory", result.stderr)
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "geteuid"),
+        "POSIX permissions required",
+    )
+    def test_cli_reports_unreadable_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            root.chmod(0o755)
+            (root / "visible.txt").write_text("visible", encoding="utf-8")
+            blocked = root / "blocked"
+            blocked.mkdir()
+            (blocked / "hidden.txt").write_text("hidden", encoding="utf-8")
+            blocked.chmod(0)
+
+            run_options = {}
+            if os.geteuid() == 0:
+                import pwd
+
+                nobody = pwd.getpwnam("nobody")
+
+                def drop_privileges() -> None:
+                    os.setgroups([])
+                    os.setgid(nobody.pw_gid)
+                    os.setuid(nobody.pw_uid)
+
+                run_options["preexec_fn"] = drop_privileges
+
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "cronbot_toolkit.checksums", str(root)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    **run_options,
+                )
+            finally:
+                blocked.chmod(0o700)
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("Permission denied", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

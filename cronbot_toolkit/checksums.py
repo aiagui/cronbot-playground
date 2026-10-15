@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import TypedDict
 
@@ -27,6 +28,28 @@ def _hash_file(path: Path, chunk_size: int = 64 * 1024) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _regular_files(root: Path) -> list[Path]:
+    """Return files below *root*, propagating directory traversal errors."""
+
+    files: list[Path] = []
+
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_symlink():
+                relative = path.relative_to(root).as_posix()
+                raise ValueError(f"symbolic links are not supported: {relative}")
+            if entry.is_dir(follow_symlinks=False):
+                visit(path)
+            elif entry.is_file(follow_symlinks=False):
+                files.append(path)
+
+    visit(root)
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
+
+
 def build_manifest(root: str | Path) -> list[ManifestEntry]:
     """Return a stable manifest for regular files below *root*.
 
@@ -41,12 +64,7 @@ def build_manifest(root: str | Path) -> list[ManifestEntry]:
         raise ValueError(f"root is not a directory: {root_path}")
 
     entries: list[ManifestEntry] = []
-    for path in sorted(root_path.rglob("*"), key=lambda item: item.as_posix()):
-        if path.is_symlink():
-            relative = path.relative_to(root_path).as_posix()
-            raise ValueError(f"symbolic links are not supported: {relative}")
-        if not path.is_file():
-            continue
+    for path in _regular_files(root_path):
         checksum, size = _hash_file(path)
         entries.append(
             {
