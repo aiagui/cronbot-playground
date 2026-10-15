@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 from typing import TypedDict
 
@@ -18,48 +20,80 @@ class ManifestEntry(TypedDict):
     size: int
 
 
-def _hash_file(path: Path, chunk_size: int = 64 * 1024) -> tuple[str, int]:
+_SECURE_OPEN_AVAILABLE = (
+    hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and os.open in os.supports_dir_fd
+)
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
+_FILE_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+)
+
+
+def _hash_file_at(
+    directory_fd: int, name: str, chunk_size: int = 64 * 1024
+) -> tuple[str, int] | None:
+    file_fd = os.open(name, _FILE_FLAGS, dir_fd=directory_fd)
     digest = hashlib.sha256()
     size = 0
-    with path.open("rb") as stream:
-        while chunk := stream.read(chunk_size):
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            return None
+        while chunk := os.read(file_fd, chunk_size):
             digest.update(chunk)
             size += len(chunk)
+    finally:
+        os.close(file_fd)
     return digest.hexdigest(), size
 
 
-def _regular_files(root: Path) -> list[Path]:
-    """Return files below *root*, propagating directory traversal errors."""
-
-    files: list[Path] = []
-
-    def visit(directory: Path) -> None:
-        with os.scandir(directory) as iterator:
-            entries = sorted(iterator, key=lambda entry: entry.name)
-        for entry in entries:
-            path = Path(entry.path)
-            if entry.is_symlink():
-                relative = path.relative_to(root).as_posix()
-                raise ValueError(f"symbolic links are not supported: {relative}")
-            if entry.is_dir(follow_symlinks=False):
-                visit(path)
-            elif entry.is_file(follow_symlinks=False):
-                files.append(path)
-
-    visit(root)
-    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
-
-
-def _first_symlink_component(path: Path) -> Path | None:
-    """Return the first symbolic link in *path*, including its parents."""
-
+def _open_root(path: Path) -> int:
+    if not _SECURE_OPEN_AVAILABLE:
+        raise OSError(errno.ENOTSUP, "secure directory traversal is unavailable")
     absolute = path if path.is_absolute() else Path.cwd() / path
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current /= part
-        if current.is_symlink():
-            return current
-    return None
+    descriptor = os.open(absolute.anchor, _DIRECTORY_FLAGS)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    try:
+                        metadata = os.stat(
+                            part, dir_fd=descriptor, follow_symlinks=False
+                        )
+                    except OSError:
+                        pass
+                    else:
+                        if stat.S_ISLNK(metadata.st_mode):
+                            raise ValueError(
+                                f"root must not contain a symbolic link: {path}"
+                            ) from error
+                if error.errno in {errno.ENOENT, errno.ENOTDIR}:
+                    raise ValueError(f"root is not a directory: {path}") from error
+                raise
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_descendant(root_fd: int, parts: tuple[str, ...]) -> int:
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts:
+            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def build_manifest(root: str | Path) -> list[ManifestEntry]:
@@ -70,25 +104,41 @@ def build_manifest(root: str | Path) -> list[ManifestEntry]:
     """
 
     root_path = Path(root)
-    symlink_component = _first_symlink_component(root_path)
-    if symlink_component is not None:
-        raise ValueError(
-            f"root must not contain a symbolic link: {symlink_component}"
-        )
-    if not root_path.is_dir():
-        raise ValueError(f"root is not a directory: {root_path}")
-
     entries: list[ManifestEntry] = []
-    for path in _regular_files(root_path):
-        checksum, size = _hash_file(path)
-        entries.append(
-            {
-                "path": path.relative_to(root_path).as_posix(),
-                "sha256": checksum,
-                "size": size,
-            }
-        )
-    return entries
+    root_fd = _open_root(root_path)
+    pending: list[tuple[str, ...]] = [()]
+    try:
+        while pending:
+            directory_parts = pending.pop()
+            directory_fd = _open_descendant(root_fd, directory_parts)
+            try:
+                with os.scandir(directory_fd) as iterator:
+                    children = sorted(iterator, key=lambda entry: entry.name)
+                for child in children:
+                    relative_parts = directory_parts + (child.name,)
+                    relative = Path(*relative_parts).as_posix()
+                    if child.is_symlink():
+                        raise ValueError(
+                            f"symbolic links are not supported: {relative}"
+                        )
+                    if child.is_dir(follow_symlinks=False):
+                        pending.append(relative_parts)
+                    elif child.is_file(follow_symlinks=False):
+                        result = _hash_file_at(directory_fd, child.name)
+                        if result is not None:
+                            checksum, size = result
+                            entries.append(
+                                {
+                                    "path": relative,
+                                    "sha256": checksum,
+                                    "size": size,
+                                }
+                            )
+            finally:
+                os.close(directory_fd)
+    finally:
+        os.close(root_fd)
+    return sorted(entries, key=lambda entry: entry["path"])
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cronbot_toolkit.checksums import build_manifest
 
@@ -63,6 +64,84 @@ class BuildManifestTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "must not contain"):
                 build_manifest(link / "nested")
+
+    def test_file_replaced_with_symlink_before_open_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "root"
+            root.mkdir()
+            victim = root / "victim.txt"
+            victim.write_text("inside", encoding="utf-8")
+            outside = base / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            real_open = os.open
+            swapped = False
+
+            def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if path == "victim.txt" and dir_fd is not None and not swapped:
+                    victim.unlink()
+                    victim.symlink_to(outside)
+                    swapped = True
+                if dir_fd is None:
+                    return real_open(path, flags, mode)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch("cronbot_toolkit.checksums.os.open", side_effect=swapping_open):
+                with self.assertRaises(OSError):
+                    build_manifest(root)
+            self.assertTrue(swapped)
+
+    def test_directory_replaced_with_symlink_before_open_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "root"
+            child = root / "child"
+            child.mkdir(parents=True)
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "outside.txt").write_text("outside", encoding="utf-8")
+            real_open = os.open
+            swapped = False
+
+            def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if path == "child" and dir_fd is not None and not swapped:
+                    child.rename(root / "original-child")
+                    child.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                if dir_fd is None:
+                    return real_open(path, flags, mode)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch("cronbot_toolkit.checksums.os.open", side_effect=swapping_open):
+                with self.assertRaises(OSError):
+                    build_manifest(root)
+            self.assertTrue(swapped)
+
+    def test_deep_tree_does_not_use_python_recursion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            current = root
+            directories = []
+            leaf = None
+            try:
+                for _ in range(sys.getrecursionlimit() + 50):
+                    current /= "d"
+                    current.mkdir()
+                    directories.append(current)
+                leaf = current / "leaf.txt"
+                leaf.write_text("leaf", encoding="utf-8")
+
+                manifest = build_manifest(root)
+
+                self.assertEqual(len(manifest), 1)
+                self.assertTrue(manifest[0]["path"].endswith("/leaf.txt"))
+            finally:
+                if leaf is not None and leaf.exists():
+                    leaf.unlink()
+                for directory in reversed(directories):
+                    directory.rmdir()
 
     def test_cli_outputs_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
