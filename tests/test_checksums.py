@@ -51,6 +51,19 @@ class BuildManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symbolic links"):
                 build_manifest(root)
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links unavailable")
+    def test_intermediate_root_symbolic_link_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            nested = root / "actual" / "nested"
+            nested.mkdir(parents=True)
+            (nested / "outside.txt").write_text("outside", encoding="utf-8")
+            link = root / "link"
+            link.symlink_to(root / "actual", target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "must not contain"):
+                build_manifest(link / "nested")
+
     def test_cli_outputs_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

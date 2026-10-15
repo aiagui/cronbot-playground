@@ -50,6 +50,18 @@ def _regular_files(root: Path) -> list[Path]:
     return sorted(files, key=lambda path: path.relative_to(root).as_posix())
 
 
+def _first_symlink_component(path: Path) -> Path | None:
+    """Return the first symbolic link in *path*, including its parents."""
+
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return current
+    return None
+
+
 def build_manifest(root: str | Path) -> list[ManifestEntry]:
     """Return a stable manifest for regular files below *root*.
 
@@ -58,8 +70,11 @@ def build_manifest(root: str | Path) -> list[ManifestEntry]:
     """
 
     root_path = Path(root)
-    if root_path.is_symlink():
-        raise ValueError(f"root must not be a symbolic link: {root_path}")
+    symlink_component = _first_symlink_component(root_path)
+    if symlink_component is not None:
+        raise ValueError(
+            f"root must not contain a symbolic link: {symlink_component}"
+        )
     if not root_path.is_dir():
         raise ValueError(f"root is not a directory: {root_path}")
 
